@@ -1,66 +1,500 @@
 #include "patches.h"
 #include "gbi_extension.h"
 
-#if 1
-RECOMP_PATCH Gfx* sub_GAME_7F097818(Gfx* gdl, SkyRelated38* v1, SkyRelated38* v2, SkyRelated38* v3, f32 scale,
-                                    bool textured) {
-    u32 width = viGetX();
-    u32 height = viGetY();
-
-    // Fetch the current environment (this is where fog and sky color are stored)
-    struct CurrentEnvironmentRecord* env = fogGetCurrentEnvironmentp();
-
-    // Get the fog color components (assumes fog color is stored in RGBA format)
-    u8 red = env->Red;
-    u8 green = env->Green;
-    u8 blue = env->Blue;
-
-    // Set the fog color as the fill color for the skybox
-    u32 fill_color = GPACK_RGBA5551(red, green, blue, 1); // Fog color instead of hardcoded light blue
-
-    // Fill the skybox with the fog color
-    gDPPipeSync(gdl++);
-    gDPSetCycleType(gdl++, G_CYC_FILL);
-    gDPSetColorImage(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, width, osViGetCurrentFramebuffer());
-    gDPSetFillColor(gdl++, (fill_color << 16) | fill_color);
-    gDPFillRectangle(gdl++, 0, 0, (width - 1), (height - 1));
-    gDPPipeSync(gdl++);
-
-    return gdl;
-}
-
-RECOMP_PATCH Gfx* sub_GAME_7F098A2C(Gfx* gdl, SkyRelated38* arg1, SkyRelated38* arg2, SkyRelated38* arg3,
-                                    SkyRelated38* arg4, f32 arg5) {
-    u32 width = viGetX();
-    u32 height = viGetY();
-
-    // Fetch the current environment to get fog color
-    struct CurrentEnvironmentRecord* env = fogGetCurrentEnvironmentp();
-
-    // Get the fog color components
-    u8 red = env->Red;
-    u8 green = env->Green;
-    u8 blue = env->Blue;
-
-    // Set the fog color as the fill color for the skybox
-    u32 fill_color = GPACK_RGBA5551(red, green, blue, 1); // Use fog color for the background
-
-    // Fill the skybox with the fog color
-    gDPPipeSync(gdl++);
-    gDPSetCycleType(gdl++, G_CYC_FILL);
-    gDPSetColorImage(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, width, osViGetCurrentFramebuffer());
-    gDPSetFillColor(gdl++, (fill_color << 16) | fill_color);
-    gDPFillRectangle(gdl++, 0, 0, (width - 1), (height - 1));
-    gDPPipeSync(gdl++);
-
-    return gdl;
-}
-
-#endif
+/**
+ * @recomp sky fix
+ *
+ * The original skyRender rasterises the sky/water planes on the CPU into raw
+ * RDP triangle commands, which RT64's HLE cannot execute.
+ * The new PORTSKY code rasterises sky polygons with real RSP geometry.
+ * To achieve a result that's close to console, we draw a camera-centred ring fan
+ * over the player's head (skyDrawPlaneFan). It reaches very close to zfar and
+ * can be tilted according the direction the player is looking at to simulate
+ * the concave sky used on the Streets level (and maybe the Runway level).
+ */
 
 #define PORTSKY 1
 
-#if 0
+#define SKYDBG 0
+
+#define SKY_PLANE_RADIUS 70000.0f
+
+#if SKYDBG
+static u32 g_SkyDbgFrame = 0;
+static u8 g_SkyDbgPrint = 0;
+#endif
+
+// KSEG0 -> physical address
+#define SKY_K0_TO_PHYS(p) ((u32) (p) & 0x1FFFFFFF)
+
+#if PORTSKY
+
+#define SKY_TEXEL_PER_WORLD 0.2f
+
+#define SKY_CLOUD_SCALE 2.0f
+
+#define SKY_BAND_OUTER 290000.0f
+
+#define SKY_MIP_LEVELS 3
+
+// 22.5-degree direction table for the sky's disc
+static const f32 DIR16[16][2] = {
+    { 1.0f, 0.0f },       { 0.92388f, 0.38268f },   { 0.7071f, 0.7071f },   { 0.38268f, 0.92388f },
+    { 0.0f, 1.0f },       { -0.38268f, 0.92388f },  { -0.7071f, 0.7071f },  { -0.92388f, 0.38268f },
+    { -1.0f, 0.0f },      { -0.92388f, -0.38268f }, { -0.7071f, -0.7071f }, { -0.38268f, -0.92388f },
+    { 0.0f, -1.0f },      { 0.38268f, -0.92388f },  { 0.7071f, -0.7071f },  { 0.92388f, -0.38268f },
+};
+
+static Gfx* skyDrawPlaneFan(Gfx* gdl, f32 plane_y, bool isWater) {
+    s32 i;
+    s32 k;
+    f32 maxc;
+    f32 fit = 1.0f;
+
+    f32 wx[25], wz[25];
+    f32 tcs[25], tct[25];
+    f32 radius[3];
+    f32 smin, tmin;
+    f32 rsp_y;
+    f32 h;
+    f32 uoff;
+    f32 texdens;
+    f32 tofft;
+    f32 depth_s = 1.0f;
+
+    f32 bx[64], bz[64];
+    f32 bcx[64], bcz[64];
+    f32 r_mid;
+    f32 r_outer;
+    s32 m;
+    s32 j;
+
+    s32 use_mips = FALSE;
+    u8* miptex = NULL;
+    coord3d* eye = bondviewGetCurrentPlayersPosition();
+
+    Gfx* bp = gdl++;
+    Vtx* verts = (Vtx*) gdl;
+    Mtx* mtx_render;
+    Mtxf fitmtx;
+    SkyRelated18 cols[8];
+
+    gdl = (Gfx*) ((u8*) gdl + 281 * sizeof(Vtx));
+    mtx_render = (Mtx*) gdl;
+    gdl = (Gfx*) ((u8*) gdl + sizeof(Mtx));
+    if (!isWater) {
+        // Room for the generated cloud mip chain: 32*32 + 16*16 + 8*8 IA8.
+        miptex = (u8*) gdl;
+        gdl = (Gfx*) ((u8*) gdl + 1344);
+    }
+    gSPBranchList(bp, SKY_K0_TO_PHYS(gdl));
+
+    if (!isWater) {
+        sImageTableEntry* simg = &skywaterimages[fogGetCurrentEnvironmentp()->SkyImageId];
+
+        if ((simg->width == 64) && (simg->height == 64) && (simg->depth == G_IM_SIZ_8b) &&
+            (simg->format == G_IM_FMT_IA) && (simg->level == 0) && (simg->index >= 0x1000)) {
+            u8* msrc = (u8*) (simg->index | 0x80000000);
+            u8* mdst = miptex;
+            s32 mw = 64;
+            s32 lvl;
+            for (lvl = 0; lvl < SKY_MIP_LEVELS; lvl++) {
+                s32 hw = mw >> 1;
+                s32 mx, my;
+                for (my = 0; my < hw; my++) {
+                    for (mx = 0; mx < hw; mx++) {
+                        u8 t00 = msrc[(my * 2) * mw + (mx * 2)];
+                        u8 t01 = msrc[(my * 2) * mw + (mx * 2) + 1];
+                        u8 t10 = msrc[(my * 2 + 1) * mw + (mx * 2)];
+                        u8 t11 = msrc[(my * 2 + 1) * mw + (mx * 2) + 1];
+                        s32 mi = ((t00 >> 4) + (t01 >> 4) + (t10 >> 4) + (t11 >> 4) + 2) >> 2;
+                        s32 ma = ((t00 & 0xF) + (t01 & 0xF) + (t10 & 0xF) + (t11 & 0xF) + 2) >> 2;
+                        mdst[my * hw + mx] = (u8) ((mi << 4) | ma);
+                    }
+                }
+                msrc = mdst;
+                mdst += hw * hw;
+                mw = hw;
+            }
+            use_mips = TRUE;
+        }
+    }
+
+    if (isWater) {
+        h = plane_y - eye->y;
+        if (h < 0.0f) {
+            h = -h;
+        }
+        if (h < 50.0f) {
+            h = 50.0f;
+        }
+    } else {
+        h = plane_y;
+        if (h < 500.0f) {
+            h = 500.0f;
+        }
+    }
+
+    radius[2] = 10.0f * h;
+    if (radius[2] > SKY_PLANE_RADIUS * 0.8f) {
+        radius[2] = SKY_PLANE_RADIUS * 0.8f;
+    }
+    radius[1] = 4.0f * h;
+    if (radius[1] > radius[2] * 0.6f) {
+        radius[1] = radius[2] * 0.6f;
+    }
+    radius[0] = 2.0f * h;
+    if (radius[0] > radius[1] * 0.6f) {
+        radius[0] = radius[1] * 0.6f;
+    }
+
+    wx[0] = eye->x;
+    wz[0] = eye->z;
+    for (k = 0; k < 3; k++) {
+        f32 r = radius[k];
+        f32 rd = r * 0.7071f;
+        f32* px = &wx[1 + k * 8];
+        f32* pz = &wz[1 + k * 8];
+        px[0] = eye->x + r;   pz[0] = eye->z;
+        px[1] = eye->x + rd;  pz[1] = eye->z + rd;
+        px[2] = eye->x;       pz[2] = eye->z + r;
+        px[3] = eye->x - rd;  pz[3] = eye->z + rd;
+        px[4] = eye->x - r;   pz[4] = eye->z;
+        px[5] = eye->x - rd;  pz[5] = eye->z - rd;
+        px[6] = eye->x;       pz[6] = eye->z - r;
+        px[7] = eye->x + rd;  pz[7] = eye->z - rd;
+    }
+
+    // Adjust disc radius to z-buffer range
+    {
+        f32 zrange[2];
+        f32 near_floor;
+        viGetZRange(zrange);
+        depth_s = (0.85f * zrange[1]) / SKY_BAND_OUTER;
+        if (depth_s > 1.0f) {
+            depth_s = 1.0f;
+        }
+        near_floor = 1.5f * zrange[0];
+        if (h * depth_s < near_floor) {
+            depth_s = near_floor / h;
+        }
+        r_outer = (0.85f * zrange[1]) / depth_s;
+        if (r_outer > SKY_BAND_OUTER) {
+            r_outer = SKY_BAND_OUTER;
+        }
+        if (r_outer < SKY_PLANE_RADIUS * 1.05f) {
+            r_outer = SKY_PLANE_RADIUS * 1.05f;
+        }
+        r_mid = (SKY_PLANE_RADIUS + r_outer) * 0.5f;
+    }
+
+    // Color the sky via fog
+    {
+        f32 fr[8];
+        fr[0] = 0.0f;
+        for (k = 0; k < 3; k++) {
+            f32 f = 1.0f - (2.0f * h) / radius[k];
+            if (f < 0.0f) f = 0.0f;
+            fr[k + 1] = f;
+        }
+        fr[4] = 1.0f - (2.0f * h) / SKY_PLANE_RADIUS;
+        if (fr[4] < 0.0f) fr[4] = 0.0f;
+        fr[5] = 1.0f - (2.0f * h) / r_mid;
+        if (fr[5] < 0.0f) fr[5] = 0.0f;
+        fr[6] = 1.0f - (2.0f * h) / r_outer;
+        if (fr[6] < 0.0f) fr[6] = 0.0f;
+        fr[7] = 1.0f;
+        for (k = 0; k < 8; k++) {
+            if (isWater) {
+                sub_GAME_7F093FA4(&cols[k], fr[k]);
+            } else {
+                skyChooseCloudVtxColour(&cols[k], fr[k]);
+            }
+        }
+    }
+
+    // Scrolling UVs
+    uoff = isWater ? g_SkyCloudOffset : 0.0f;
+    texdens = isWater ? SKY_TEXEL_PER_WORLD : SKY_TEXEL_PER_WORLD / SKY_CLOUD_SCALE;
+    tofft = isWater ? g_SkyCloudOffset : g_SkyCloudOffset / SKY_CLOUD_SCALE;
+    smin = 3.4e38f;
+    tmin = 3.4e38f;
+    for (i = 0; i < 25; i++) {
+        tcs[i] = wx[i] * texdens + uoff;
+        tct[i] = wz[i] * texdens + tofft;
+        if (tcs[i] < smin) smin = tcs[i];
+        if (tct[i] < tmin) tmin = tct[i];
+    }
+
+    smin = (f32) (((s32) (smin / 4096.0f)) * 4096);
+    tmin = (f32) (((s32) (tmin / 4096.0f)) * 4096);
+
+    rsp_y = (isWater ? (plane_y - eye->y) : h) * depth_s;
+    maxc = rsp_y < 0.0f ? -rsp_y : rsp_y;
+    for (i = 0; i < 25; i++) {
+        f32 cx = (wx[i] - eye->x) * depth_s;
+        f32 cz = (wz[i] - eye->z) * depth_s;
+        f32 c;
+        wx[i] = cx;
+        wz[i] = cz;
+        c = cx < 0.0f ? -cx : cx;
+        if (c > maxc) maxc = c;
+        c = cz < 0.0f ? -cz : cz;
+        if (c > maxc) maxc = c;
+    }
+
+    for (m = 0; m < 16; m++) {
+        f32 attach_r = (m & 1) ? radius[2] * 0.92388f : radius[2];
+        bx[m] = eye->x + attach_r * DIR16[m][0];
+        bz[m] = eye->z + attach_r * DIR16[m][1];
+        bx[16 + m] = eye->x + SKY_PLANE_RADIUS * DIR16[m][0];
+        bz[16 + m] = eye->z + SKY_PLANE_RADIUS * DIR16[m][1];
+        bx[32 + m] = eye->x + r_mid * DIR16[m][0];
+        bz[32 + m] = eye->z + r_mid * DIR16[m][1];
+        bx[48 + m] = eye->x + r_outer * DIR16[m][0];
+        bz[48 + m] = eye->z + r_outer * DIR16[m][1];
+    }
+    for (m = 0; m < 64; m++) {
+        f32 c;
+        bcx[m] = (bx[m] - eye->x) * depth_s;
+        bcz[m] = (bz[m] - eye->z) * depth_s;
+        c = bcx[m] < 0.0f ? -bcx[m] : bcx[m];
+        if (c > maxc) maxc = c;
+        c = bcz[m] < 0.0f ? -bcz[m] : bcz[m];
+        if (c > maxc) maxc = c;
+    }
+
+    if (maxc > 32000.0f) {
+        fit = 32000.0f / maxc;
+    }
+
+    guScaleF(fitmtx.m, 1.0f / fit, 1.0f / fit, 1.0f / fit);
+
+    // Handle sky concavity
+    {
+        Mtxf viewrot;
+        Mtxf composed;
+        Mtxf* wts = camGetWorldToScreenMtxf();
+        f32 conc = fogGetCurrentEnvironmentp()->WaterConcavity;
+        for (i = 0; i < 4; i++) {
+            for (k = 0; k < 4; k++) {
+                viewrot.m[i][k] = wts->m[i][k];
+            }
+        }
+        viewrot.m[3][0] = 0.0f;
+        viewrot.m[3][1] = 0.0f;
+        viewrot.m[3][2] = 0.0f;
+
+        matrix_4x4_multiply(&viewrot, &fitmtx, &composed);
+
+        if (conc != 0.0f && !isWater) {
+            Mtxf pitch;
+            Mtxf lifted;
+            f32 t = conc / (currentPlayerGetProjectionMatrixF()->m[1][1] * (getPlayer_c_screenheight() * 0.5f));
+            f32 cs = 1.0f / sqrtf(1.0f + t * t);
+            f32 sn = t * cs;
+            guScaleF(pitch.m, 1.0f, 1.0f, 1.0f);
+            pitch.m[1][1] = cs;
+            pitch.m[1][2] = sn;
+            pitch.m[2][1] = -sn;
+            pitch.m[2][2] = cs;
+            matrix_4x4_multiply(&pitch, &composed, &lifted);
+            composed = lifted;
+        }
+
+        matrix_4x4_f32_to_s32(&composed, (Mtxf*) mtx_render);
+    }
+
+    for (i = 0; i < 25; i++) {
+        SkyRelated18* col;
+        if (i == 0) col = &cols[0];
+        else if (i < 9) col = &cols[1];
+        else if (i < 17) col = &cols[2];
+        else col = &cols[3];
+        verts[i].v.ob[0] = wx[i] * fit;
+        verts[i].v.ob[1] = rsp_y * fit;
+        verts[i].v.ob[2] = wz[i] * fit;
+        verts[i].v.tc[0] = skyClamp(tcs[i] - smin, -32768.f, 32767.f);
+        verts[i].v.tc[1] = skyClamp(tct[i] - tmin, -32768.f, 32767.f);
+#if SKYDBG
+        verts[i].v.cn[0] = fogGetCurrentEnvironmentp()->Red;
+        verts[i].v.cn[1] = fogGetCurrentEnvironmentp()->Green;
+        verts[i].v.cn[2] = fogGetCurrentEnvironmentp()->Blue;
+        verts[i].v.cn[3] = 0xff;
+#else
+        verts[i].v.cn[0] = col->r;
+        verts[i].v.cn[1] = col->g;
+        verts[i].v.cn[2] = col->b;
+        verts[i].v.cn[3] = col->a;
+#endif
+    }
+
+    for (j = 0; j < 3; j++) {
+        f32 uvscale = texdens;
+        f32 period = 4096.0f;
+        f32 su = uoff;
+        f32 sv = tofft;
+        if (use_mips) {
+            uvscale /= (f32) (2 << j);
+            period = (f32) (4096 >> (j + 1));
+            su = uoff / (f32) (2 << j);
+            sv = tofft / (f32) (2 << j);
+        }
+        for (m = 0; m < 16; m++) {
+            s32 m2 = (m + 1) & 15;
+            s32 q[4];
+            f32 qs[4], qt[4];
+            f32 qsmin, qtmin;
+            Vtx* v = verts + 25 + (j * 16 + m) * 4;
+            q[0] = j * 16 + m;
+            q[1] = j * 16 + m2;
+            q[2] = (j + 1) * 16 + m;
+            q[3] = (j + 1) * 16 + m2;
+            for (k = 0; k < 4; k++) {
+                qs[k] = bx[q[k]] * uvscale + su;
+                qt[k] = bz[q[k]] * uvscale + sv;
+            }
+            qsmin = qs[0];
+            qtmin = qt[0];
+            for (k = 1; k < 4; k++) {
+                if (qs[k] < qsmin) qsmin = qs[k];
+                if (qt[k] < qtmin) qtmin = qt[k];
+            }
+            qsmin = (f32) (((s32) (qsmin / period)) * period);
+            qtmin = (f32) (((s32) (qtmin / period)) * period);
+            for (k = 0; k < 4; k++) {
+                SkyRelated18* bcol = (k < 2) ? &cols[3 + j] : &cols[4 + j];
+                v[k].v.ob[0] = bcx[q[k]] * fit;
+                v[k].v.ob[1] = rsp_y * fit;
+                v[k].v.ob[2] = bcz[q[k]] * fit;
+                v[k].v.tc[0] = skyClamp(qs[k] - qsmin, -32768.f, 32767.f);
+                v[k].v.tc[1] = skyClamp(qt[k] - qtmin, -32768.f, 32767.f);
+                v[k].v.cn[0] = bcol->r;
+                v[k].v.cn[1] = bcol->g;
+                v[k].v.cn[2] = bcol->b;
+                v[k].v.cn[3] = bcol->a;
+            }
+        }
+    }
+
+    for (m = 0; m < 16; m++) {
+        s32 m2 = (m + 1) & 15;
+        Vtx* v = verts + 217 + m * 4;
+        for (k = 0; k < 4; k++) {
+            s32 src = 48 + ((k & 1) ? m2 : m);
+            SkyRelated18* scol = (k < 2) ? &cols[6] : &cols[7];
+            v[k].v.ob[0] = bcx[src] * fit;
+            v[k].v.ob[1] = (k < 2) ? (s16) (rsp_y * fit) : 0;
+            v[k].v.ob[2] = bcz[src] * fit;
+            v[k].v.tc[0] = 0;
+            v[k].v.tc[1] = 0;
+            v[k].v.cn[0] = scol->r;
+            v[k].v.cn[1] = scol->g;
+            v[k].v.cn[2] = scol->b;
+            v[k].v.cn[3] = scol->a;
+        }
+    }
+
+    // Clear culling and G_FOG because the new sky uses its own fog
+    gSPClearGeometryMode(gdl++, G_CULL_BOTH | G_FOG);
+
+#if SKYDBG
+    gDPSetCombineMode(gdl++, G_CC_SHADE, G_CC_SHADE);
+#endif
+
+    gSPMatrix(gdl++, SKY_K0_TO_PHYS(mtx_render), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+
+    // Batch 1: centre fan (verts 0-8).
+    gSPVertex(gdl++, SKY_K0_TO_PHYS(verts), 9, 0);
+    gSP4Triangles(gdl++, 0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5);
+    gSP4Triangles(gdl++, 0, 5, 6, 0, 6, 7, 0, 7, 8, 0, 8, 1);
+
+    // Batch 2: ring r1 -> r2 (verts 1-16 as slots 0-15: inner k, outer k+8).
+    gSPVertex(gdl++, SKY_K0_TO_PHYS(verts + 1), 16, 0);
+    for (k = 0; k < 8; k += 2) {
+        s32 a = k, b = (k + 1) & 7, a2 = k + 8, b2 = ((k + 1) & 7) + 8;
+        s32 c = k + 1, d = (k + 2) & 7, c2 = k + 1 + 8, d2 = ((k + 2) & 7) + 8;
+        gSP4Triangles(gdl++, a, b, b2, b2, a2, a, c, d, d2, d2, c2, c);
+    }
+
+    // Batch 3: ring r2 -> r3 (verts 9-24 as slots 0-15).
+    gSPVertex(gdl++, SKY_K0_TO_PHYS(verts + 9), 16, 0);
+    for (k = 0; k < 8; k += 2) {
+        s32 a = k, b = (k + 1) & 7, a2 = k + 8, b2 = ((k + 1) & 7) + 8;
+        s32 c = k + 1, d = (k + 2) & 7, c2 = k + 1 + 8, d2 = ((k + 2) & 7) + 8;
+        gSP4Triangles(gdl++, a, b, b2, b2, a2, a, c, d, d2, d2, c2, c);
+    }
+
+    // Batches 4-6: textured outer bands why mips so it looks closer to console
+    for (j = 0; j < 3; j++) {
+        if (use_mips) {
+            s32 mw = 32 >> j;
+            u8* mlvl = miptex + ((j == 0) ? 0 : (j == 1) ? 1024 : 1280);
+            sImageTableEntry* simg = &skywaterimages[fogGetCurrentEnvironmentp()->SkyImageId];
+            gDPPipeSync(gdl++);
+            gDPLoadTextureBlock(gdl++, SKY_K0_TO_PHYS(mlvl), G_IM_FMT_IA, G_IM_SIZ_8b, mw, mw, 0,
+                                simg->flagsS, simg->flagsT, 5 - j, 5 - j, G_TX_NOLOD, G_TX_NOLOD);
+        }
+        for (m = 0; m < 16; m++) {
+            gSPVertex(gdl++, SKY_K0_TO_PHYS(verts + 25 + (j * 16 + m) * 4), 4, 0);
+            gSP2Triangles(gdl++, 0, 1, 3, 0, 3, 2, 0, 0);
+        }
+    }
+
+    // Batch 7: Shading
+    gDPPipeSync(gdl++);
+    gDPSetCombineMode(gdl++, G_CC_SHADE, G_CC_SHADE);
+    for (k = 0; k < 16; k++) {
+        gSPVertex(gdl++, SKY_K0_TO_PHYS(verts + 217 + k * 4), 4, 0);
+        gSP2Triangles(gdl++, 0, 1, 3, 0, 3, 2, 0, 0);
+    }
+
+#if SKYDBG
+    {
+        if (g_SkyDbgPrint) {
+            recomp_printf("SKYFAN water=%d planey=%d eye=(%d,%d,%d) h=%d rspy=%d fit1e6=%d tc0=%d tc1=%d tc9=%d vp=%x phys=%x w0=%x cn0=%x\n",
+                          isWater, (s32) plane_y, (s32) eye->x, (s32) eye->y, (s32) eye->z, (s32) h,
+                          (s32) rsp_y, (s32) (fit * 1000000.0f),
+                          verts[0].v.tc[0], verts[1].v.tc[0], verts[9].v.tc[0],
+                          (u32) verts, SKY_K0_TO_PHYS(verts), *(u32*) verts,
+                          *(u32*) &verts[0].v.cn[0]);
+            recomp_printf(" cols0=(%d,%d,%d,%d) cols2=(%d,%d,%d,%d) cols3=(%d,%d,%d,%d) env=(%d,%d,%d) cloudRGB=(%d,%d,%d)\n",
+                          cols[0].r, cols[0].g, cols[0].b, cols[0].a,
+                          cols[2].r, cols[2].g, cols[2].b, cols[2].a,
+                          cols[3].r, cols[3].g, cols[3].b, cols[3].a,
+                          fogGetCurrentEnvironmentp()->Red, fogGetCurrentEnvironmentp()->Green,
+                          fogGetCurrentEnvironmentp()->Blue,
+                          (s32) fogGetCurrentEnvironmentp()->CloudRed,
+                          (s32) fogGetCurrentEnvironmentp()->CloudGreen,
+                          (s32) fogGetCurrentEnvironmentp()->CloudBlue);
+        }
+    }
+#endif
+
+    // Restore the back-face culling
+    gSPSetGeometryMode(gdl++, G_CULL_BACK);
+
+    return gdl;
+}
+#endif
+
+// @recomp: fill the letterbox rows
+static Gfx* skyFillLetterboxBars(Gfx* gdl, s32 viewtop, s32 viewbottom) {
+    if (getPlayerCount() != 1) {
+        return gdl;
+    }
+    gEXSetRectAlign(gdl++, G_EX_ORIGIN_LEFT, G_EX_ORIGIN_RIGHT, 0, 0, 0, 0);
+    if (viewtop > 0) {
+        gDPFillRectangle(gdl++, 0, 0, 0, viewtop - 1);
+    }
+    if (viewbottom < 240) {
+        gDPFillRectangle(gdl++, 0, viewbottom, 0, 239);
+    }
+    gEXSetRectAlign(gdl++, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE, 0, 0, 0, 0);
+    return gdl;
+}
+
+#if 1
 RECOMP_PATCH Gfx* skyRender(Gfx* gdl) __attribute__((optnone)) {
     coord3d sp6a4;
     coord3d sp698;
@@ -122,6 +556,10 @@ RECOMP_PATCH Gfx* skyRender(Gfx* gdl) __attribute__((optnone)) {
     sp430 = FALSE;
     env = fogGetCurrentEnvironmentp();
 
+#if SKYDBG
+    g_SkyDbgPrint = (g_SkyDbgFrame++ & 63) == 0;
+#endif
+
     if (!fogGetCurrentEnvironmentp()->Clouds) {
         if (getPlayerCount() == 1) {
             gDPSetCycleType(gdl++, G_CYC_FILL);
@@ -130,6 +568,9 @@ RECOMP_PATCH Gfx* skyRender(Gfx* gdl) __attribute__((optnone)) {
 
             gDPFillRectangle(gdl++, viGetViewLeft(), viGetViewTop(), viGetViewLeft() + viGetViewWidth() - 1,
                              viGetViewTop() + viGetViewHeight() - 1);
+
+            // @recomp: sky-color the letterbox rows
+            gdl = skyFillLetterboxBars(gdl, viGetViewTop(), viGetViewTop() + viGetViewHeight());
 
             gDPPipeSync(gdl++);
             return gdl;
@@ -149,6 +590,20 @@ RECOMP_PATCH Gfx* skyRender(Gfx* gdl) __attribute__((optnone)) {
     }
 
     gdl = viSetFillColor(gdl, env->Red, env->Green, env->Blue);
+
+#if PORTSKY
+    // Fill the view with the fog colour first
+    gDPPipeSync(gdl++);
+    gDPSetCycleType(gdl++, G_CYC_FILL);
+    gDPFillRectangle(gdl++, g_CurrentPlayer->viewleft, g_CurrentPlayer->viewtop,
+                     (g_CurrentPlayer->viewleft + g_CurrentPlayer->viewx) - 1,
+                     (g_CurrentPlayer->viewtop + g_CurrentPlayer->viewy) - 1);
+
+    // @recomp: sky-color the letterbox rows
+    gdl = skyFillLetterboxBars(gdl, g_CurrentPlayer->viewtop, g_CurrentPlayer->viewtop + g_CurrentPlayer->viewy);
+
+    gDPPipeSync(gdl++);
+#endif
 
     if (&sp6a4)
         ;
@@ -676,46 +1131,8 @@ RECOMP_PATCH Gfx* skyRender(Gfx* gdl) __attribute__((optnone)) {
                 gdl = sub_GAME_7F097818(gdl, &sp274[0], &sp274[1], &sp274[2], 130.0f, TRUE);
             }
 #else
-            {
-                s32 i;
-                Vtx* verts = dynAllocate7F0BD6C4(s1);
-                Mtxf mtx;
-                Mtx* mtx_render = dynAllocateMatrix();
-
-                matrix_4x4_multiply(camGetWorldToScreenMtxf(), &dword_CODE_bss_80079E98, &mtx);
-                matrix_4x4_f32_to_s32(&mtx, mtx_render);
-                // mtxF2L(&mtx, mtx_render);
-
-                gSPClearGeometryMode(gdl++, G_CULL_BOTH);
-
-                gSPMatrix(gdl++, OS_K0_TO_PHYSICAL(mtx_render), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_PUSH);
-                gSPVertex(gdl++, osVirtualToPhysical(verts), s1, 0);
-
-                for (i = 0; i < s1; i++) {
-                    verts[i].v.ob[0] = sp43c[i].unk00;
-                    verts[i].v.ob[1] = sp43c[i].unk04;
-                    verts[i].v.ob[2] = sp43c[i].unk08;
-                    verts[i].v.tc[0] = skyClamp(sp43c[i].unk0c * 0.1f + g_SkyCloudOffset, -32768.f, 32767.f);
-                    verts[i].v.tc[1] =
-                        skyClamp((sp43c[i].unk10 - g_SkyCloudOffset) * 0.1f + g_SkyCloudOffset, -32768.f, 32767.f);
-                    verts[i].v.cn[0] = sp43c[i].r;
-                    verts[i].v.cn[1] = sp43c[i].g;
-                    verts[i].v.cn[2] = sp43c[i].b;
-                    verts[i].v.cn[3] = sp43c[i].a;
-                }
-
-                // gSP2Triangles(gdl++, 0, 1, 2, 0, 0, 2, 3, 0);
-
-                if (s1 == 4) {
-                    gDPTri2(gdl++, 0, 1, 3, 3, 2, 0);
-                } else if (s1 == 5) {
-                    gDPTri3(gdl++, 0, 1, 2, 0, 2, 3, 0, 3, 4);
-                } else if (s1 == 3) {
-                    gDPTri1(gdl++, 0, 1, 2);
-                }
-
-                // gSPPopMatrix(gdl++, G_MTX_MODELVIEW);
-            }
+            // Recomp water plane fan
+            gdl = skyDrawPlaneFan(gdl, fogGetCurrentEnvironmentp()->WaterRepeat, TRUE);
 #endif
         }
     }
@@ -1178,44 +1595,8 @@ RECOMP_PATCH Gfx* skyRender(Gfx* gdl) __attribute__((optnone)) {
         }
     }
 #else
-        {
-            s32 i;
-            static Vtx verts[10] = {0};
-            // Col* cols = dynAllocate(s1 * sizeof(Col));
-            Mtxf mtx;
-            static Mtx mtx_render[10] = {0};
-            matrix_4x4_multiply(camGetWorldToScreenMtxf(), &dword_CODE_bss_80079E98, &mtx);
-            matrix_4x4_f32_to_s32(&mtx, mtx_render);
-
-            // gSPSetExtraGeometryModeEXT(gdl++, 0x00000100);
-            gSPMatrix(gdl++, osVirtualToPhysical(mtx_render), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_PUSH);
-            // gSPColor(gdl++, osVirtualToPhysical(cols), s1);
-            gSPVertex(gdl++, osVirtualToPhysical(verts), s1, 0);
-
-            for (i = 0; i < s1; ++i) {
-                verts[i].v.ob[0] = sp4b4[i].unk00;
-                verts[i].v.ob[1] = sp4b4[i].unk04;
-                verts[i].v.ob[2] = sp4b4[i].unk08;
-                verts[i].v.tc[0] = skyClamp(sp4b4[i].unk0c, -32768.f, 32767.f);
-                verts[i].v.tc[1] = skyClamp(sp4b4[i].unk10, -32768.f, 32767.f);
-                // verts[i].colour = i * 4;
-                verts[i].v.cn[0] = sp4b4[i].r;
-                verts[i].v.cn[1] = sp4b4[i].g;
-                verts[i].v.cn[2] = sp4b4[i].b;
-                verts[i].v.cn[3] = sp4b4[i].a;
-            }
-        }
-
-        if (s1 == 4) {
-            gDPTri2(gdl++, 0, 1, 3, 3, 2, 0);
-        } else if (s1 == 5) {
-            gDPTri3(gdl++, 0, 1, 2, 0, 2, 3, 0, 3, 4);
-        } else if (s1 == 3) {
-            gDPTri1(gdl++, 0, 1, 2);
-        }
-
-        // gSPPopMatrix(gdl++, G_MTX_MODELVIEW);
-        // gSPClearExtraGeometryModeEXT(gdl++, 0x00000100);
+        // Recomp's cloud plane fan
+        gdl = skyDrawPlaneFan(gdl, fogGetCurrentEnvironmentp()->CloudRepeat, FALSE);
     }
 #endif
 
