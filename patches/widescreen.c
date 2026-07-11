@@ -1,5 +1,10 @@
 #include "patches.h"
 
+#define WS_FULLFRAME_ROOM_SCISSOR 1
+#define WS_INSTSIZE_X4 1
+#define WS_LODSCALE_DIV8 1
+#define WS_DISTANCE_ALWAYS_DISABLED 1
+
 #if 0
 RECOMP_PATCH Gfx* dynGetMasterDisplayList(void) {
     g_GfxRequestedDisplayList = TRUE;
@@ -68,9 +73,14 @@ RECOMP_PATCH Gfx* bgScissorCurrentPlayerView(Gfx* gdl, s32 left, s32 top, s32 wi
         height = player->viewtop + player->viewy;
     }
 
+#if WS_FULLFRAME_ROOM_SCISSOR
     // @recomp: use gEXSetScissor instead
     // gDPSetScissor(gdl++, G_SC_NON_INTERLACE, left, top, width, height);
     gEXSetScissor(gdl++, G_SC_NON_INTERLACE, G_EX_ORIGIN_LEFT, G_EX_ORIGIN_RIGHT, 0, 0, 0, 240);
+#else
+    // This is closer to vanilla
+    gEXSetScissor(gdl++, G_SC_NON_INTERLACE, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE, left, top, width, height);
+#endif
 
     return gdl;
 }
@@ -78,12 +88,17 @@ RECOMP_PATCH Gfx* bgScissorCurrentPlayerView(Gfx* gdl, s32 left, s32 top, s32 wi
 
 #if 1
 RECOMP_PATCH void modelSetDistanceDisabled(s32 param_1) {
+#if WS_DISTANCE_ALWAYS_DISABLED
     // @recomp: ModelDistance always disabled
     if ((g_StageNum == LEVELID_JUNGLE)) {
         g_ModelDistanceDisabled = 0;
     } else {
         g_ModelDistanceDisabled = 1;
     }
+#else
+    // Honor the level's own setting.
+    g_ModelDistanceDisabled = param_1;
+#endif
 }
 #endif
 
@@ -229,11 +244,16 @@ RECOMP_PATCH f32 getinstsize(Model* arg0) // @theboy181
     }
 #endif
 
+#if WS_INSTSIZE_X4
     if (demoMode == 0) { // @theboy181 - fps fix - Demo timing fix
         ret = arg0->obj->BoundingVolumeRadius * arg0->scale * 4;
     } else {
         ret = arg0->obj->BoundingVolumeRadius * arg0->scale;
     } // @recomp:
+#else
+    // Closer to vanilla
+    ret = arg0->obj->BoundingVolumeRadius * arg0->scale;
+#endif
 
     return ret;
 }
@@ -241,7 +261,12 @@ RECOMP_PATCH f32 getinstsize(Model* arg0) // @theboy181
 
 #if 1
 RECOMP_PATCH f32 getPlayer_c_lodscalez(void) {
+#if WS_LODSCALE_DIV8
     return g_CurrentPlayer->c_lodscalez / 8; // @theboy181 - Proper LOD fix?
+#else
+    // Vanilla LOD scale.
+    return g_CurrentPlayer->c_lodscalez;
+#endif
 }
 #endif
 
